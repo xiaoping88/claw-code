@@ -19,6 +19,7 @@ use super::{preflight_message_request, Provider, ProviderFuture};
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_DASHSCOPE_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
+pub const DEFAULT_GITHUB_COPILOT_BASE_URL: &str = "https://api.githubcopilot.com";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -41,11 +42,13 @@ pub struct OpenAiCompatConfig {
 const XAI_ENV_VARS: &[&str] = &["XAI_API_KEY"];
 const OPENAI_ENV_VARS: &[&str] = &["OPENAI_API_KEY"];
 const DASHSCOPE_ENV_VARS: &[&str] = &["DASHSCOPE_API_KEY"];
+const GITHUB_COPILOT_ENV_VARS: &[&str] = &["GITHUB_TOKEN"];
 
 // Provider-specific request body size limits in bytes
 const XAI_MAX_REQUEST_BODY_BYTES: usize = 52_428_800; // 50MB
 const OPENAI_MAX_REQUEST_BODY_BYTES: usize = 104_857_600; // 100MB
 const DASHSCOPE_MAX_REQUEST_BODY_BYTES: usize = 6_291_456; // 6MB (observed limit in dogfood)
+const GITHUB_COPILOT_MAX_REQUEST_BODY_BYTES: usize = 10_485_760; // 10MB
 
 impl OpenAiCompatConfig {
     #[must_use]
@@ -85,12 +88,29 @@ impl OpenAiCompatConfig {
         }
     }
 
+    /// GitHub Copilot API endpoint.
+    /// Uses the OpenAI-compatible REST shape at api.githubcopilot.com.
+    /// Requires a GitHub personal access token with Copilot access via
+    /// the `GITHUB_TOKEN` environment variable.
+    /// Models available: gpt-4o, gpt-4o-mini, claude-sonnet-4-5, o1-mini, etc.
+    #[must_use]
+    pub const fn github_copilot() -> Self {
+        Self {
+            provider_name: "GitHub Copilot",
+            api_key_env: "GITHUB_TOKEN",
+            base_url_env: "GITHUB_COPILOT_BASE_URL",
+            default_base_url: DEFAULT_GITHUB_COPILOT_BASE_URL,
+            max_request_body_bytes: GITHUB_COPILOT_MAX_REQUEST_BODY_BYTES,
+        }
+    }
+
     #[must_use]
     pub fn credential_env_vars(self) -> &'static [&'static str] {
         match self.provider_name {
             "xAI" => XAI_ENV_VARS,
             "OpenAI" => OPENAI_ENV_VARS,
             "DashScope" => DASHSCOPE_ENV_VARS,
+            "GitHub Copilot" => GITHUB_COPILOT_ENV_VARS,
             _ => &[],
         }
     }
@@ -131,6 +151,17 @@ impl OpenAiCompatClient {
 
     pub fn from_env(config: OpenAiCompatConfig) -> Result<Self, ApiError> {
         let Some(api_key) = read_env_non_empty(config.api_key_env)? else {
+            // For GitHub Copilot, also check the device-flow stored token.
+            if config.provider_name == "GitHub Copilot" {
+                if let Ok(Some(stored_token)) = runtime::load_github_token() {
+                    return Ok(Self::new(stored_token, config));
+                }
+                return Err(ApiError::missing_credentials_with_hint(
+                    config.provider_name,
+                    config.credential_env_vars(),
+                    "run `claw auth copilot` to authenticate via GitHub device flow",
+                ));
+            }
             return Err(ApiError::missing_credentials(
                 config.provider_name,
                 config.credential_env_vars(),
@@ -801,7 +832,10 @@ fn strip_routing_prefix(model: &str) -> &str {
         let prefix = &model[..pos];
         // Only strip if the prefix before "/" is a known routing prefix,
         // not if "/" appears in the middle of the model name for other reasons.
-        if matches!(prefix, "openai" | "xai" | "grok" | "qwen" | "kimi") {
+        if matches!(
+            prefix,
+            "openai" | "xai" | "grok" | "qwen" | "kimi" | "copilot"
+        ) {
             &model[pos + 1..]
         } else {
             model
@@ -2195,9 +2229,16 @@ mod tests {
 
     #[test]
     fn provider_specific_size_limits_are_correct() {
-        assert_eq!(OpenAiCompatConfig::dashscope().max_request_body_bytes, 6_291_456); // 6MB
-        assert_eq!(OpenAiCompatConfig::openai().max_request_body_bytes, 104_857_600); // 100MB
-        assert_eq!(OpenAiCompatConfig::xai().max_request_body_bytes, 52_428_800); // 50MB
+        assert_eq!(
+            OpenAiCompatConfig::dashscope().max_request_body_bytes,
+            6_291_456
+        ); // 6MB
+        assert_eq!(
+            OpenAiCompatConfig::openai().max_request_body_bytes,
+            104_857_600
+        ); // 100MB
+        assert_eq!(OpenAiCompatConfig::xai().max_request_body_bytes, 52_428_800);
+        // 50MB
     }
 
     #[test]
@@ -2206,5 +2247,16 @@ mod tests {
         assert_eq!(super::strip_routing_prefix("kimi/kimi-k2.5"), "kimi-k2.5");
         assert_eq!(super::strip_routing_prefix("kimi-k2.5"), "kimi-k2.5"); // no prefix, unchanged
         assert_eq!(super::strip_routing_prefix("kimi/kimi-k1.5"), "kimi-k1.5");
+    }
+
+    #[test]
+    fn strip_routing_prefix_strips_copilot_provider_prefix() {
+        // copilot/ prefix should be stripped for wire format
+        assert_eq!(super::strip_routing_prefix("copilot/gpt-4o"), "gpt-4o");
+        assert_eq!(
+            super::strip_routing_prefix("copilot/claude-sonnet-4-5"),
+            "claude-sonnet-4-5"
+        );
+        assert_eq!(super::strip_routing_prefix("gpt-4o"), "gpt-4o"); // no prefix, unchanged
     }
 }

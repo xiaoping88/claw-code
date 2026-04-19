@@ -1,5 +1,6 @@
 mod client;
 mod error;
+mod github_device_flow;
 mod http_client;
 mod prompt_cache;
 mod providers;
@@ -11,6 +12,10 @@ pub use client::{
     resolve_startup_auth_source, MessageStream, OAuthTokenSet, ProviderClient,
 };
 pub use error::ApiError;
+pub use github_device_flow::{
+    fetch_copilot_models, github_client_id, poll_for_token, request_device_code, CopilotModel,
+    DeviceCodeInfo, DeviceFlowError,
+};
 pub use http_client::{
     build_http_client, build_http_client_or_default, build_http_client_with, ProxyConfig,
 };

@@ -275,6 +275,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         )?,
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
+        CliAction::AuthCopilot => run_auth_copilot()?,
+        CliAction::AuthCopilotLogout => run_auth_copilot_logout()?,
+        CliAction::CopilotModels => run_copilot_models()?,
     }
     Ok(())
 }
@@ -367,6 +370,9 @@ enum CliAction {
     Help {
         output_format: CliOutputFormat,
     },
+    AuthCopilot,
+    AuthCopilotLogout,
+    CopilotModels,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -674,6 +680,17 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "system-prompt" => parse_system_prompt_args(&rest[1..], output_format),
         "acp" => parse_acp_args(&rest[1..], output_format),
         "login" | "logout" => Err(removed_auth_surface_error(rest[0].as_str())),
+        "auth" => match rest.get(1).map(String::as_str) {
+            Some("copilot") => match rest.get(2).map(String::as_str) {
+                Some("logout") => Ok(CliAction::AuthCopilotLogout),
+                Some("models") => Ok(CliAction::CopilotModels),
+                _ => Ok(CliAction::AuthCopilot),
+            },
+            Some(other) => Err(format!(
+                "unknown auth subcommand `{other}`; supported: copilot"
+            )),
+            None => Err("usage: claw auth copilot [logout|models]".to_string()),
+        },
         "init" => Ok(CliAction::Init { output_format }),
         "export" => parse_export_args(&rest[1..], output_format),
         "prompt" => {
@@ -796,6 +813,162 @@ fn removed_auth_surface_error(command_name: &str) -> String {
     format!(
         "`claw {command_name}` has been removed. Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead."
     )
+}
+
+fn run_auth_copilot() -> Result<(), String> {
+    use api::{github_client_id, poll_for_token, request_device_code};
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("failed to build async runtime: {e}"))?;
+
+    rt.block_on(async {
+        let client_id = github_client_id();
+
+        let device_info = request_device_code(&client_id)
+            .await
+            .map_err(|e| format!("failed to start device flow: {e}"))?;
+
+        println!("To authenticate with GitHub Copilot:");
+        println!();
+        println!("  1. Open:  {}", device_info.verification_uri);
+        println!("  2. Enter: {}", device_info.user_code);
+        println!();
+        println!("Waiting for authorization...");
+
+        let token = poll_for_token(&client_id, &device_info)
+            .await
+            .map_err(|e| format!("authentication failed: {e}"))?;
+
+        runtime::save_github_token(&token)
+            .map_err(|e| format!("failed to save GitHub token: {e}"))?;
+
+        println!("Authenticated successfully. Token saved to ~/.claw/credentials.json");
+        println!("You can now use GitHub Copilot models with `claw --model copilot/gpt-4o`");
+        Ok(())
+    })
+}
+
+fn run_auth_copilot_logout() -> Result<(), String> {
+    runtime::clear_github_token().map_err(|e| format!("failed to clear GitHub token: {e}"))?;
+    println!("GitHub Copilot token removed.");
+    Ok(())
+}
+
+fn resolve_copilot_token() -> Result<String, String> {
+    // Priority: GITHUB_TOKEN env var → stored device-flow token
+    if let Ok(t) = std::env::var("GITHUB_TOKEN") {
+        if !t.trim().is_empty() {
+            return Ok(t);
+        }
+    }
+    runtime::load_github_token()
+        .map_err(|e| format!("failed to read credentials: {e}"))?
+        .ok_or_else(|| {
+            "no GitHub Copilot token found. Run `claw auth copilot` to authenticate.".to_string()
+        })
+}
+
+fn run_copilot_models() -> Result<(), String> {
+    use api::fetch_copilot_models;
+
+    let token = resolve_copilot_token()?;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("failed to build async runtime: {e}"))?;
+
+    let models = rt
+        .block_on(fetch_copilot_models(&token))
+        .map_err(|e| format!("failed to fetch Copilot models: {e}"))?;
+
+    if models.is_empty() {
+        println!("No models returned by the Copilot API.");
+        return Ok(());
+    }
+
+    // Column widths
+    let id_width = models.iter().map(|m| m.id.len()).max().unwrap_or(5).max(5);
+    let name_width = models
+        .iter()
+        .map(|m| m.name.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let vendor_width = models
+        .iter()
+        .map(|m| m.vendor.len())
+        .max()
+        .unwrap_or(6)
+        .max(6);
+
+    println!(
+        "{:<id_width$}  {:<name_width$}  {:<vendor_width$}  {:>10}  {:>12}  Tools",
+        "MODEL ID",
+        "NAME",
+        "VENDOR",
+        "CONTEXT",
+        "MAX OUTPUT",
+        id_width = id_width,
+        name_width = name_width,
+        vendor_width = vendor_width,
+    );
+    println!(
+        "{:-<id_width$}  {:-<name_width$}  {:-<vendor_width$}  {:->10}  {:->12}  -----",
+        "",
+        "",
+        "",
+        "",
+        "",
+        id_width = id_width,
+        name_width = name_width,
+        vendor_width = vendor_width,
+    );
+
+    for m in &models {
+        let context = if m.max_context_tokens > 0 {
+            format_tokens(m.max_context_tokens)
+        } else {
+            "-".to_string()
+        };
+        let output = if m.max_output_tokens > 0 {
+            format_tokens(m.max_output_tokens)
+        } else {
+            "-".to_string()
+        };
+        let tools = if m.supports_tools { "yes" } else { "no" };
+        println!(
+            "{:<id_width$}  {:<name_width$}  {:<vendor_width$}  {:>10}  {:>12}  {tools}",
+            m.id,
+            m.name,
+            m.vendor,
+            context,
+            output,
+            id_width = id_width,
+            name_width = name_width,
+            vendor_width = vendor_width,
+        );
+    }
+
+    println!();
+    println!(
+        "Use with: claw --model copilot/<MODEL ID>  (e.g. `claw --model copilot/{}`)",
+        models[0].id
+    );
+    Ok(())
+}
+
+/// Format a token count as a human-readable string (e.g. 128k, 1M).
+fn format_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{}M", n / 1_000_000)
+    } else if n >= 1_000 {
+        format!("{}k", n / 1_000)
+    } else {
+        n.to_string()
+    }
 }
 
 fn parse_acp_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
@@ -8421,6 +8594,7 @@ mod tests {
             request_id: Some("req_jobdori_789".to_string()),
             body: String::new(),
             retryable: true,
+            suggested_action: None,
         };
 
         let rendered = format_user_visible_api_error("session-issue-22", &error);
@@ -8443,6 +8617,7 @@ mod tests {
                 request_id: Some("req_jobdori_790".to_string()),
                 body: String::new(),
                 retryable: true,
+                suggested_action: None,
             }),
         };
 
@@ -8506,6 +8681,7 @@ mod tests {
             request_id: Some("req_ctx_456".to_string()),
             body: String::new(),
             retryable: false,
+            suggested_action: None,
         };
 
         let rendered = format_user_visible_api_error("session-issue-32", &error);
@@ -8537,6 +8713,7 @@ mod tests {
                 request_id: Some("req_ctx_retry_789".to_string()),
                 body: String::new(),
                 retryable: false,
+                suggested_action: None,
             }),
         };
 

@@ -131,6 +131,15 @@ const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
             default_base_url: openai_compat::DEFAULT_DASHSCOPE_BASE_URL,
         },
     ),
+    (
+        "copilot",
+        ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "GITHUB_TOKEN",
+            base_url_env: "GITHUB_COPILOT_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_GITHUB_COPILOT_BASE_URL,
+        },
+    ),
 ];
 
 #[must_use]
@@ -155,6 +164,7 @@ pub fn resolve_model_alias(model: &str) -> String {
                 },
                 ProviderKind::OpenAi => match *alias {
                     "kimi" => "kimi-k2.5",
+                    "copilot" => "gpt-4o",
                     _ => trimmed,
                 },
             })
@@ -216,6 +226,17 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             default_base_url: openai_compat::DEFAULT_DASHSCOPE_BASE_URL,
         });
     }
+    // GitHub Copilot API endpoint (OpenAI-compatible).
+    // Routes copilot/* model names to api.githubcopilot.com.
+    // Also routes bare model names when only GITHUB_TOKEN is present.
+    if canonical.starts_with("copilot/") {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "GITHUB_TOKEN",
+            base_url_env: "GITHUB_COPILOT_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_GITHUB_COPILOT_BASE_URL,
+        });
+    }
     None
 }
 
@@ -241,6 +262,12 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
     }
     if openai_compat::has_api_key("XAI_API_KEY") {
         return ProviderKind::Xai;
+    }
+    // GitHub Copilot: if GITHUB_TOKEN is set, fall back to Copilot.
+    // The metadata_for_model path handles explicit copilot/ prefix models;
+    // this handles bare model names when only GITHUB_TOKEN is available.
+    if openai_compat::has_api_key("GITHUB_TOKEN") {
+        return ProviderKind::OpenAi;
     }
     // Last resort: if OPENAI_BASE_URL is set without OPENAI_API_KEY (some
     // local providers like Ollama don't require auth), still route there.
@@ -294,6 +321,24 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
         "kimi-k2.5" | "kimi-k1.5" => Some(ModelTokenLimit {
             max_output_tokens: 16_384,
             context_window_tokens: 256_000,
+        }),
+        // GitHub Copilot models
+        // Source: https://docs.github.com/en/copilot/using-github-copilot/ai-models
+        "gpt-4o" | "gpt-4o-mini" => Some(ModelTokenLimit {
+            max_output_tokens: 16_384,
+            context_window_tokens: 128_000,
+        }),
+        "o1" | "o1-preview" => Some(ModelTokenLimit {
+            max_output_tokens: 32_768,
+            context_window_tokens: 128_000,
+        }),
+        "o1-mini" => Some(ModelTokenLimit {
+            max_output_tokens: 65_536,
+            context_window_tokens: 128_000,
+        }),
+        "o3-mini" => Some(ModelTokenLimit {
+            max_output_tokens: 100_000,
+            context_window_tokens: 200_000,
         }),
         _ => None,
     }
@@ -352,6 +397,11 @@ const FOREIGN_PROVIDER_ENV_VARS: &[(&str, &str, &str)] = &[
         "DASHSCOPE_API_KEY",
         "Alibaba DashScope",
         "prefix your model name with `qwen/` or `qwen-` (e.g. `--model qwen-plus`) so prefix routing selects the DashScope backend",
+    ),
+    (
+        "GITHUB_TOKEN",
+        "GitHub Copilot",
+        "prefix your model name with `copilot/` (e.g. `--model copilot/gpt-4o`) so prefix routing selects the GitHub Copilot backend",
     ),
 ];
 
@@ -611,6 +661,31 @@ mod tests {
     }
 
     #[test]
+    fn copilot_prefix_routes_to_github_copilot() {
+        // copilot/ prefix must route to GitHub Copilot endpoint with GITHUB_TOKEN auth
+        let meta = super::metadata_for_model("copilot/gpt-4o")
+            .expect("copilot/ prefix must resolve to GitHub Copilot metadata");
+        assert_eq!(meta.provider, ProviderKind::OpenAi);
+        assert_eq!(meta.auth_env, "GITHUB_TOKEN");
+        assert_eq!(meta.base_url_env, "GITHUB_COPILOT_BASE_URL");
+        assert!(meta.default_base_url.contains("githubcopilot.com"));
+
+        // Other models with copilot/ prefix also route correctly
+        let meta2 = super::metadata_for_model("copilot/claude-sonnet-4-5")
+            .expect("copilot/ prefix must resolve to GitHub Copilot metadata");
+        assert_eq!(meta2.auth_env, "GITHUB_TOKEN");
+        assert_eq!(
+            meta2.default_base_url,
+            super::openai_compat::DEFAULT_GITHUB_COPILOT_BASE_URL
+        );
+    }
+
+    #[test]
+    fn copilot_alias_resolves_to_gpt_4o() {
+        assert_eq!(super::resolve_model_alias("copilot"), "gpt-4o");
+    }
+
+    #[test]
     fn keeps_existing_max_token_heuristic() {
         assert_eq!(max_tokens_for_model("opus"), 32_000);
         assert_eq!(max_tokens_for_model("grok-3"), 64_000);
@@ -753,14 +828,14 @@ mod tests {
     #[test]
     fn returns_context_window_metadata_for_kimi_models() {
         // kimi-k2.5
-        let k25_limit = model_token_limit("kimi-k2.5")
-            .expect("kimi-k2.5 should have token limit metadata");
+        let k25_limit =
+            model_token_limit("kimi-k2.5").expect("kimi-k2.5 should have token limit metadata");
         assert_eq!(k25_limit.max_output_tokens, 16_384);
         assert_eq!(k25_limit.context_window_tokens, 256_000);
 
         // kimi-k1.5
-        let k15_limit = model_token_limit("kimi-k1.5")
-            .expect("kimi-k1.5 should have token limit metadata");
+        let k15_limit =
+            model_token_limit("kimi-k1.5").expect("kimi-k1.5 should have token limit metadata");
         assert_eq!(k15_limit.max_output_tokens, 16_384);
         assert_eq!(k15_limit.context_window_tokens, 256_000);
     }
@@ -768,11 +843,13 @@ mod tests {
     #[test]
     fn kimi_alias_resolves_to_kimi_k25_token_limits() {
         // The "kimi" alias resolves to "kimi-k2.5" via resolve_model_alias()
-        let alias_limit = model_token_limit("kimi")
-            .expect("kimi alias should resolve to kimi-k2.5 limits");
-        let direct_limit = model_token_limit("kimi-k2.5")
-            .expect("kimi-k2.5 should have limits");
-        assert_eq!(alias_limit.max_output_tokens, direct_limit.max_output_tokens);
+        let alias_limit =
+            model_token_limit("kimi").expect("kimi alias should resolve to kimi-k2.5 limits");
+        let direct_limit = model_token_limit("kimi-k2.5").expect("kimi-k2.5 should have limits");
+        assert_eq!(
+            alias_limit.max_output_tokens,
+            direct_limit.max_output_tokens
+        );
         assert_eq!(
             alias_limit.context_window_tokens,
             direct_limit.context_window_tokens

@@ -324,6 +324,89 @@ pub fn parse_oauth_callback_query(query: &str) -> Result<OAuthCallbackParams, St
     })
 }
 
+// ── GitHub OAuth Device Flow ──────────────────────────────────────────────────
+
+/// Response from the GitHub device/code endpoint (RFC 8628 §3.2).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct GithubDeviceCodeResponse {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    /// Lifetime of the device code in seconds.
+    pub expires_in: u64,
+    /// Minimum polling interval in seconds.
+    #[serde(default = "default_poll_interval")]
+    pub interval: u64,
+}
+
+fn default_poll_interval() -> u64 {
+    5
+}
+
+/// Outcome of polling the GitHub token endpoint during device flow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GithubDeviceTokenResponse {
+    /// Authorization is still pending; caller should wait `interval` seconds.
+    Pending,
+    /// The user took too long; the device code has expired.
+    Expired,
+    /// The user denied the request.
+    AccessDenied,
+    /// Authorization succeeded; contains the access token.
+    Success { access_token: String },
+}
+
+/// Raw JSON shape returned by the GitHub token endpoint.
+#[derive(Debug, Clone, Deserialize)]
+struct GithubTokenPayload {
+    access_token: Option<String>,
+    error: Option<String>,
+}
+
+impl From<GithubTokenPayload> for GithubDeviceTokenResponse {
+    fn from(payload: GithubTokenPayload) -> Self {
+        if let Some(token) = payload.access_token {
+            return Self::Success {
+                access_token: token,
+            };
+        }
+        match payload.error.as_deref() {
+            Some("expired_token") => Self::Expired,
+            Some("access_denied") => Self::AccessDenied,
+            // "authorization_pending", "slow_down", unknown errors, or no error field
+            _ => Self::Pending,
+        }
+    }
+}
+
+/// Load a saved GitHub personal access token (stored by device flow login).
+/// Returns `None` when no token has been saved.
+pub fn load_github_token() -> io::Result<Option<String>> {
+    let path = credentials_path()?;
+    let root = read_credentials_root(&path)?;
+    Ok(root
+        .get("github_token")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned))
+}
+
+/// Persist a GitHub personal access token obtained via device flow.
+pub fn save_github_token(token: &str) -> io::Result<()> {
+    let path = credentials_path()?;
+    let mut root = read_credentials_root(&path)?;
+    root.insert("github_token".to_string(), Value::String(token.to_string()));
+    write_credentials_root(&path, &root)
+}
+
+/// Remove a previously saved GitHub token.
+pub fn clear_github_token() -> io::Result<()> {
+    let path = credentials_path()?;
+    let mut root = read_credentials_root(&path)?;
+    root.remove("github_token");
+    write_credentials_root(&path, &root)
+}
+
 fn generate_random_token(bytes: usize) -> io::Result<String> {
     let mut buffer = vec![0_u8; bytes];
     File::open("/dev/urandom")?.read_exact(&mut buffer)?;

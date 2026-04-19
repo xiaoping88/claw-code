@@ -32,14 +32,27 @@ impl ProviderClient {
                 OpenAiCompatConfig::xai(),
             )?)),
             ProviderKind::OpenAi => {
-                // DashScope models (qwen-*) also return ProviderKind::OpenAi because they
-                // speak the OpenAI wire format, but they need the DashScope config which
-                // reads DASHSCOPE_API_KEY and points at dashscope.aliyuncs.com.
+                // DashScope models (qwen-*) and GitHub Copilot models (copilot/*)
+                // also return ProviderKind::OpenAi because they speak the OpenAI
+                // wire format, but they need provider-specific configs.
                 let config = match providers::metadata_for_model(&resolved_model) {
                     Some(meta) if meta.auth_env == "DASHSCOPE_API_KEY" => {
                         OpenAiCompatConfig::dashscope()
                     }
-                    _ => OpenAiCompatConfig::openai(),
+                    Some(meta) if meta.auth_env == "GITHUB_TOKEN" => {
+                        OpenAiCompatConfig::github_copilot()
+                    }
+                    _ => {
+                        // If no explicit prefix matched but GITHUB_TOKEN is set and no
+                        // other OpenAI key is available, route to GitHub Copilot.
+                        let has_openai_key = openai_compat::has_api_key("OPENAI_API_KEY");
+                        let has_github_token = openai_compat::has_api_key("GITHUB_TOKEN");
+                        if has_github_token && !has_openai_key {
+                            OpenAiCompatConfig::github_copilot()
+                        } else {
+                            OpenAiCompatConfig::openai()
+                        }
+                    }
                 };
                 Ok(Self::OpenAi(OpenAiCompatClient::from_env(config)?))
             }
