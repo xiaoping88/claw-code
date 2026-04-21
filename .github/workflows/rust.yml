@@ -1,22 +1,93 @@
-name: Rust
+name: Build and Release
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [main, feature_dev]
+    tags: ['v*']
   pull_request:
-    branches: [ "main" ]
+    branches: [main]
+  workflow_dispatch:
 
-env:
-  CARGO_TERM_COLOR: always
+permissions:
+  contents: write
 
 jobs:
   build:
-
-    runs-on: ubuntu-latest
+    name: ${{ matrix.platform.name }}
+    runs-on: ${{ matrix.platform.os }}
+    defaults:
+      run:
+        working-directory: rust
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: linux-x64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin: claw
+          # - name: linux-arm64
+          #   os: ubuntu-latest
+          #   target: aarch64-unknown-linux-gnu
+          #   bin: claw
+          # - name: windows-x64
+          #   os: windows-latest
+          #   target: x86_64-pc-windows-msvc
+          #   bin: claw.exe
+          # - name: windows-arm64
+          #   os: windows-latest
+          #   target: aarch64-pc-windows-msvc
+          #   bin: claw.exe
+          # - name: macos-arm64
+          #   os: macos-14
+          #   target: aarch64-apple-darwin
+          #   bin: claw
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform.target }}
+
+      - name: Install cross-compilation dependencies (Linux ARM64)
+        if: matrix.platform.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust -> target
+          key: ${{ matrix.platform.target }}
+
+      - name: Build release binary
+        shell: bash
+        run: |
+          if [ "${{ matrix.platform.target }}" == "aarch64-unknown-linux-gnu" ]; then
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+          fi
+          cargo build --release -p rusty-claude-cli --target ${{ matrix.platform.target }}
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.platform.target }}/release/${{ matrix.platform.bin }}" "dist/${{ matrix.platform.name }}"
+          chmod +x "dist/${{ matrix.platform.name }}"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform.name }}
+          path: rust/dist/${{ matrix.platform.name }}
+
+      - name: Upload release asset
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: rust/dist/${{ matrix.platform.name }}
+          fail_on_unmatched_files: true
